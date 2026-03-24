@@ -114,23 +114,13 @@ export default function Notifications({ role }) {
     const icon = notificationIcon(n.message);
 
     return (
-      <div
-        key={n.id}
-        style={{
-          ...(isUnread ? unreadCardStyle : readCardStyle),
-          overflow: "hidden",
-          width: "100%",
-          boxSizing: "border-box",
-        }}
-      >
+      <div key={n.id} style={isUnread ? unreadCardStyle : readCardStyle}>
         <div
           style={{
             display: "flex",
             justifyContent: "space-between",
             alignItems: "flex-start",
             gap: 12,
-            minWidth: 0,
-            width: "100%",
           }}
         >
           <div

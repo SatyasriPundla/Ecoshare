@@ -48,7 +48,7 @@ function getStatusBadgeStyle(status) {
       border: "1px solid #86efac",
     };
   }
-  if (s === "on_the_way" || s === "accepted") {
+  if (s === "on_the_way" || s === "accepted" || s === "started" || s === "reached") {
     return {
       background: "#dbeafe",
       color: "#1e40af",
@@ -159,7 +159,7 @@ export default function DonationsDashboard({ destinationType, title }) {
   const reassignmentRequestedRef = useRef(new Set());
   const reassignmentAutoRef = useRef(new Set());
   const userRole = localStorage.getItem("role");
-  const ngoName =
+  const actorName =
     auth?.currentUser?.displayName ||
     (destinationType === "compost" ? "Compost Team" : "NGO");
   const actorPrefix = destinationType === "compost" ? "Compost" : "NGO";
@@ -173,6 +173,13 @@ export default function DonationsDashboard({ destinationType, title }) {
     milestone = "",
   }) {
     if (!userId || !type || !message) return;
+    if (
+      destinationType === "compost" &&
+      role === "donor" &&
+      String(message).trim().startsWith("NGO")
+    ) {
+      return;
+    }
     const key = donationId + "_" + type + "_" + (milestone || "none");
     if (sentKeysRef.current.has(key)) {
       return;
@@ -191,13 +198,29 @@ export default function DonationsDashboard({ destinationType, title }) {
     sentKeysRef.current.add(key);
   }
 
-  function formatDistanceText(distanceKm, includeFromLocation = false) {
+  /** Donor pushes only; blocks stray "NGO …" copies in compost flow. */
+  async function addDonorNotificationDoc(payload) {
+    const msg = String(payload?.message ?? "");
+    if (destinationType === "compost" && msg.startsWith("NGO")) return;
+    await addDoc(collection(db, "notifications"), payload);
+  }
+
+  /** Segment for donor distance line: "... is <segment> away from your location" */
+  function formatDonorDistanceSegment(distanceKm) {
     const meters = Math.max(0, Math.round(distanceKm * 1000));
     if (meters >= 1000) {
-      const km = (meters / 1000).toFixed(2);
-      return includeFromLocation ? `${km} km away from your location` : `${km} km away`;
+      return `${(meters / 1000).toFixed(2)} km`;
     }
-    return includeFromLocation ? `${meters} meters away from your location` : `${meters} meters away`;
+    return `${meters} meters`;
+  }
+
+  /** Detailed donor copy: "Name's qty food donation" (omits missing qty/food safely). */
+  function donorDetailedDonationPhrase(donation) {
+    const donorName = donation?.donor_name || "Donor";
+    const quantity = String(donation?.quantity ?? "").trim();
+    const food = String(donation?.food_name ?? "").trim();
+    const mid = [quantity, food].filter(Boolean).join(" ");
+    return mid ? `${donorName}'s ${mid} donation` : `${donorName}'s donation`;
   }
 
   async function sendInitialDistanceNotification(donation) {
@@ -214,13 +237,13 @@ export default function DonationsDashboard({ destinationType, title }) {
           const ngoLat = pos.coords.latitude;
           const ngoLng = pos.coords.longitude;
           const distanceKm = getDistance(ngoLat, ngoLng, donorLat, donorLng);
-          const distanceLabel = formatDistanceText(distanceKm, true);
+          const distSeg = formatDonorDistanceSegment(distanceKm);
           await sendNotification({
             donationId: donation.id,
             userId: donorUserId,
             role: "donor",
             type: "distance_initial",
-            message: `NGO ${ngoName} is ${distanceLabel}`,
+            message: `${actorPrefix} ${actorName} is ${distSeg} away from your location`,
             milestone: "initial_distance_once",
           });
           initialDistanceSentRef.current.add(donation.id);
@@ -261,34 +284,30 @@ export default function DonationsDashboard({ destinationType, title }) {
 
         const lastNotifiedM = liveDistanceNotifiedRef.current.get(donation.id);
         if (
-          lastNotifiedM == null ||
-          Math.abs(distanceM - lastNotifiedM) >= 200
+          destinationType !== "compost" &&
+          (lastNotifiedM == null || Math.abs(distanceM - lastNotifiedM) >= 200)
         ) {
           liveDistanceNotifiedRef.current.set(donation.id, distanceM);
-          const distanceLabel = formatDistanceText(distanceKm, false);
-          await addDoc(collection(db, "notifications"), {
+          const distSeg = formatDonorDistanceSegment(distanceKm);
+          await addDonorNotificationDoc({
             userId: donorUserId,
-            message: `NGO ${ngoName} is ${distanceLabel}`,
+            message: `${actorPrefix} ${actorName} is ${distSeg} away from your location`,
             donationId: donation.id,
             createdAt: serverTimestamp(),
             read: false,
           });
+        } else if (destinationType === "compost") {
+          liveDistanceNotifiedRef.current.set(donation.id, distanceM);
         }
 
         if (distanceM <= 50 && !liveReachedRef.current.has(donation.id)) {
           liveReachedRef.current.add(donation.id);
-          await addDoc(collection(db, "notifications"), {
-            userId: donorUserId,
-            message: `NGO ${ngoName} has reached your location`,
-            donationId: donation.id,
-            createdAt: serverTimestamp(),
-            read: false,
-          });
+          // Reached copy + dedupe: handled only in checkLocation() (one donor notification).
 
           // Optional reached status update for tracking flow.
-          await updateDoc(doc(db, "donations", donation.id), { status: "Reached" });
+          await updateDoc(doc(db, "donations", donation.id), { status: "reached" });
           setDonations((prev) =>
-            prev.map((d) => (d.id === donation.id ? { ...d, status: "Reached" } : d))
+            prev.map((d) => (d.id === donation.id ? { ...d, status: "reached" } : d))
           );
           stopLiveTracking(donation.id);
         }
@@ -404,22 +423,23 @@ export default function DonationsDashboard({ destinationType, title }) {
   }, [notification]);
 
   const checkLocation = useCallback(async (donation, ngoLat, ngoLng, currentUser) => {
+    const prefix = destinationType === "compost" ? "Compost" : "NGO";
+    const actorDisplayName =
+      auth?.currentUser?.displayName ||
+      (destinationType === "compost" ? "Compost Team" : "NGO");
+
     const donorLat = Number(donation.latitude);
     const donorLng = Number(donation.longitude);
     if (!Number.isFinite(donorLat) || !Number.isFinite(donorLng)) return;
     const donorUserId = donation.donor_id || donation.userId;
     if (!donorUserId) return;
-    const actorLabel = destinationType === "compost" ? "Compost team" : "NGO";
     const actorRole = destinationType === "compost" ? "compost" : destinationType;
     const actorUserId =
       destinationType === "compost"
         ? donation.compost_id || currentUser.uid
         : currentUser.uid;
 
-    const donorName = donation.donor_name || "Donor";
-    const quantity = donation.quantity || "";
-    const food = donation.food_name || "";
-    const donationText = `${donorName}'s ${quantity}${food ? ` ${food}` : ""}`;
+    const actorSelfDetail = donorDetailedDonationPhrase(donation);
 
     const distance = getDistance(ngoLat, ngoLng, donorLat, donorLng);
     setDistanceByDonation((prev) => ({
@@ -427,16 +447,14 @@ export default function DonationsDashboard({ destinationType, title }) {
       [donation.id]: distance,
     }));
 
-    const sameLocation =
-      Math.abs(ngoLat - donorLat) < 0.001 &&
-      Math.abs(ngoLng - donorLng) < 0.001;
+    const donorReachedCopy = `${prefix} ${actorDisplayName} has reached your location`;
 
-    if (sameLocation) {
+    if (donation.status === "reached") {
       if (reachedRef.current.has(donation.id)) return;
       reachedRef.current.add(donation.id);
 
-      await addDoc(collection(db, "notifications"), {
-        message: `${actorPrefix} ${ngoName} has reached for ${donationText} donation`,
+      await addDonorNotificationDoc({
+        message: donorReachedCopy,
         donationId: donation.id,
         userId: donorUserId,
         role: "donor",
@@ -446,7 +464,37 @@ export default function DonationsDashboard({ destinationType, title }) {
       });
 
       await addDoc(collection(db, "notifications"), {
-        message: `You reached for ${donationText} donation`,
+        message: `You reached for ${actorSelfDetail}`,
+        donationId: donation.id,
+        userId: actorUserId,
+        role: actorRole,
+        type: "ngo_action",
+        createdAt: serverTimestamp(),
+        read: false,
+      });
+      return;
+    }
+
+    const sameLocation =
+      Math.abs(ngoLat - donorLat) < 0.001 &&
+      Math.abs(ngoLng - donorLng) < 0.001;
+
+    if (sameLocation) {
+      if (reachedRef.current.has(donation.id)) return;
+      reachedRef.current.add(donation.id);
+
+      await addDonorNotificationDoc({
+        message: donorReachedCopy,
+        donationId: donation.id,
+        userId: donorUserId,
+        role: "donor",
+        type: "reached",
+        createdAt: serverTimestamp(),
+        read: false,
+      });
+
+      await addDoc(collection(db, "notifications"), {
+        message: `You reached for ${actorSelfDetail}`,
         donationId: donation.id,
         userId: actorUserId,
         role: actorRole,
@@ -464,16 +512,16 @@ export default function DonationsDashboard({ destinationType, title }) {
     // Trigger only while crossing these distance milestones.
     if (distance <= 0.2) {
       milestone = "sent200m";
-      message = `${actorPrefix} ${ngoName} is very close (200m) for ${donationText} donation`;
+      message = `${prefix} ${actorDisplayName} is 200 meters away from your location`;
     } else if (distance <= 0.5) {
       milestone = "sent500m";
-      message = `${actorPrefix} ${ngoName} is 500 meters away for ${donationText} donation`;
+      message = `${prefix} ${actorDisplayName} is 500 meters away from your location`;
     } else if (distance <= 1) {
       milestone = "sent1km";
-      message = `${actorPrefix} ${ngoName} is 1 km away for ${donationText} donation`;
+      message = `${prefix} ${actorDisplayName} is 1 km away from your location`;
     } else if (distance <= 2) {
       milestone = "sent2km";
-      message = `${actorPrefix} ${ngoName} is 2 km away for ${donationText} donation`;
+      message = `${prefix} ${actorDisplayName} is 2 km away from your location`;
     }
 
     if (milestone) {
@@ -481,7 +529,7 @@ export default function DonationsDashboard({ destinationType, title }) {
       if (!distanceRef.current.has(key)) {
         distanceRef.current.add(key);
 
-        await addDoc(collection(db, "notifications"), {
+        await addDonorNotificationDoc({
           message,
           donationId: donation.id,
           userId: donorUserId,
@@ -497,8 +545,8 @@ export default function DonationsDashboard({ destinationType, title }) {
       if (reachedRef.current.has(donation.id)) return;
       reachedRef.current.add(donation.id);
 
-      await addDoc(collection(db, "notifications"), {
-        message: `${actorPrefix} ${ngoName} has reached for ${donationText} donation`,
+      await addDonorNotificationDoc({
+        message: donorReachedCopy,
         donationId: donation.id,
         userId: donorUserId,
         role: "donor",
@@ -508,7 +556,7 @@ export default function DonationsDashboard({ destinationType, title }) {
       });
 
       await addDoc(collection(db, "notifications"), {
-        message: `You reached for ${donationText} donation`,
+        message: `You reached for ${actorSelfDetail}`,
         donationId: donation.id,
         userId: actorUserId,
         role: actorRole,
@@ -518,7 +566,7 @@ export default function DonationsDashboard({ destinationType, title }) {
       });
 
     }
-  }, [destinationType]);
+  }, [destinationType, auth?.currentUser?.displayName]);
 
   useEffect(() => {
     if (destinationType !== "ngo" && destinationType !== "compost") return undefined;
@@ -530,7 +578,12 @@ export default function DonationsDashboard({ destinationType, title }) {
       const currentUser = auth.currentUser;
       if (!currentUser) return;
 
-      const active = donations.filter((d) => d.status === "on_the_way");
+      const active = donations.filter(
+        (d) =>
+          d.status === "on_the_way" ||
+          d.status === "started" ||
+          d.status === "reached"
+      );
       for (const d of active) {
         await checkLocation(d, ngoLat, ngoLng, currentUser);
       }
@@ -548,7 +601,12 @@ export default function DonationsDashboard({ destinationType, title }) {
         const currentUser = auth.currentUser;
         if (!currentUser) return;
 
-        const active = donationsRef.current.filter((d) => d.status === "on_the_way");
+        const active = donationsRef.current.filter(
+          (d) =>
+            d.status === "on_the_way" ||
+            d.status === "started" ||
+            d.status === "reached"
+        );
         for (const d of active) {
           await checkLocation(d, ngoLat, ngoLng, currentUser);
         }
@@ -600,7 +658,7 @@ export default function DonationsDashboard({ destinationType, title }) {
       setDonations((prev) =>
         prev.map((d) =>
           d.id === donation.id
-            ? { ...d, reassignmentRequested: false, status: "on_the_way" }
+            ? { ...d, reassignmentRequested: false, status: "started" }
             : d
         )
       );
@@ -647,7 +705,7 @@ export default function DonationsDashboard({ destinationType, title }) {
           userId: d?.ngo_id || actorId,
           role: actorRole,
           type: "reassignment_request",
-          message: `${actorPrefix} ${ngoName}: Only 1 hour left. Can you complete this pickup for ${donationText} donation?`,
+          message: `${actorPrefix} ${actorName}: Only 1 hour left. Can you complete this pickup for ${donationText} donation?`,
           milestone: "one_hour_left_prompt",
         });
 
@@ -713,20 +771,14 @@ export default function DonationsDashboard({ destinationType, title }) {
       setNotification({ message: "Donation accepted successfully!" });
       await sendInitialDistanceNotification(donation);
 
-      const donorName = donation.donor_name || "Donor";
-      const quantity = donation.quantity || "";
-      const food = donation.food_name || "";
-      const donationText = `${donorName}'s ${quantity}${food ? ` ${food}` : ""}`;
-
-      const donorMessage = `${actorPrefix} ${ngoName} has accepted ${donationText} donation`;
-
       const matchedDonation = donations.find((d) => d.id === id);
+      const detailed = donorDetailedDonationPhrase(donation);
       await sendNotification({
         donationId: id,
         userId: matchedDonation?.userId,
         role: "donor",
         type: "accepted",
-        message: donorMessage,
+        message: `${actorPrefix} ${actorName} has accepted ${detailed}`,
         milestone: "accepted",
       });
 
@@ -735,7 +787,7 @@ export default function DonationsDashboard({ destinationType, title }) {
         userId: auth?.currentUser?.uid,
         role: destinationType,
         type: "ngo_action",
-        message: `You accepted ${donationText} donation`,
+        message: `You accepted ${detailed}`,
         milestone: "accepted_actor",
       });
     } catch (acceptError) {
@@ -750,27 +802,23 @@ export default function DonationsDashboard({ destinationType, title }) {
       const id = donation.id;
 
       console.log("On the Way clicked");
-      await updateDoc(doc(db, "donations", id), { status: "on_the_way" });
+      await updateDoc(doc(db, "donations", id), { status: "started" });
 
       setDonations((prev) =>
-        prev.map((d) => (d.id === id ? { ...d, status: "on_the_way" } : d))
+        prev.map((d) => (d.id === id ? { ...d, status: "started" } : d))
       );
       startLiveTracking(donation);
 
       const matchedDonation = donations.find((d) => d.id === id);
       console.log("Sending notifications...");
 
-      const donorName = donation.donor_name || "Donor";
-      const quantity = donation.quantity || "";
-      const food = donation.food_name || "";
-      const donationText = `${donorName}'s ${quantity}${food ? ` ${food}` : ""}`;
-
+      const detailed = donorDetailedDonationPhrase(donation);
       await sendNotification({
         donationId: id,
         userId: matchedDonation?.userId,
         role: "donor",
         type: "on_the_way",
-        message: `${actorPrefix} ${ngoName} is on the way for ${donationText} donation`,
+        message: `${actorPrefix} ${actorName} is on the way for ${detailed}`,
         milestone: "on_the_way",
       });
 
@@ -779,7 +827,7 @@ export default function DonationsDashboard({ destinationType, title }) {
         userId: auth?.currentUser?.uid,
         role: destinationType,
         type: "ngo_action",
-        message: `You started pickup for ${donationText} donation`,
+        message: `You started pickup for ${detailed}`,
         milestone: "on_the_way_actor",
       });
     } catch (onTheWayError) {
@@ -821,9 +869,6 @@ export default function DonationsDashboard({ destinationType, title }) {
           : donation?.ngo_id
             ? String(donation.ngo_id)
             : null;
-      const ngoName =
-        auth?.currentUser?.displayName ||
-        (destinationType === "compost" ? "Compost Team" : "NGO");
 
       console.log("🧾 Extracted IDs:", { donorId, ngoId });
 
@@ -833,14 +878,10 @@ export default function DonationsDashboard({ destinationType, title }) {
       }
 
       if (donorId) {
-        const donorName = donation.donor_name || "Donor";
-        const quantity = donation.quantity || "";
-        const food = donation.food_name || "";
-        const donationText = `${donorName}'s ${quantity}${food ? ` ${food}` : ""}`;
-
-        await addDoc(collection(db, "notifications"), {
+        const detailed = donorDetailedDonationPhrase(donation);
+        await addDonorNotificationDoc({
           userId: donorId,
-          message: `${actorPrefix} ${ngoName} completed ${donationText} donation successfully`,
+          message: `${actorPrefix} ${actorName} has completed ${detailed}`,
           donationId: donation.id,
           role: "donor",
           createdAt: serverTimestamp(),
@@ -853,14 +894,10 @@ export default function DonationsDashboard({ destinationType, title }) {
       }
 
       if (ngoId) {
-        const donorName = donation.donor_name || "Donor";
-        const quantity = donation.quantity || "";
-        const food = donation.food_name || "";
-        const donationText = `${donorName}'s ${quantity}${food ? ` ${food}` : ""}`;
-
+        const selfDetail = donorDetailedDonationPhrase(donation);
         await addDoc(collection(db, "notifications"), {
           userId: ngoId,
-          message: `You completed ${donationText} donation successfully`,
+          message: `You completed ${selfDetail}`,
           donationId: donation.id,
           role: "ngo",
           createdAt: serverTimestamp(),
@@ -887,7 +924,11 @@ export default function DonationsDashboard({ destinationType, title }) {
   }
 
   const pendingPickups = donations.filter(
-    (d) => d.status === "accepted" || d.status === "on_the_way"
+    (d) =>
+      d.status === "accepted" ||
+      d.status === "started" ||
+      d.status === "on_the_way" ||
+      d.status === "reached"
   );
   const completedDonations = donations.filter((d) => d.status === "completed");
 
@@ -975,11 +1016,12 @@ export default function DonationsDashboard({ destinationType, title }) {
             ⏱ {expiryLabel}
           </p>
         ) : null}
-        {d.status === "on_the_way" && Number.isFinite(distanceByDonation[d.id]) ? (
+        {(d.status === "on_the_way" || d.status === "started" || d.status === "reached") &&
+        Number.isFinite(distanceByDonation[d.id]) ? (
           distanceByDonation[d.id] < 0.1 ? (
             userRole === "donor" ? (
               <p style={{ color: "#22C55E", fontWeight: "bold" }}>
-                NGO reached your location 🚚
+                {actorPrefix} reached your location 🚚
               </p>
             ) : null
           ) : (
@@ -1028,7 +1070,7 @@ export default function DonationsDashboard({ destinationType, title }) {
             </>
           )}
 
-          {d.status === "on_the_way" && (
+          {(d.status === "on_the_way" || d.status === "started" || d.status === "reached") && (
             <>
               <button
                 className="btn-secondary"
